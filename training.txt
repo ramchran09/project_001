@@ -1,0 +1,593 @@
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+import pickle
+import warnings
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import RobustScaler
+
+warnings.filterwarnings("ignore")
+
+
+os.makedirs("/content", exist_ok=True)
+DSL_PATH = "/content/DSL-StrongPasswordData.csv"
+FREE_TEXT_PATH = "/content/free-text.csv"
+
+OUTPUT_CLEANED = "/content/cleaned_window_data.csv"
+OUTPUT_SCALED = "/content/scaled_window_data.csv"
+OUTPUT_SEQUENCES = "/content/sequence_data.npy"
+OUTPUT_SCALER = "/content/scaler.pkl"
+
+WINDOW_SECONDS = 3.0
+PAUSE_THRESHOLD = 0.5
+MIN_EVENTS_PER_WINDOW = 3
+MAX_VALID_TIME = 30.0
+MIN_EVENT_DURATION = 1e-3
+SEQ_LEN = 5
+RANDOM_STATE = 42
+
+FEATURE_COLS = [
+    "avg_dwell","avg_flight","typing_speed",
+    "pause_count","backspace_count",
+    "std_dwell","std_flight"
+]
+
+FINAL_COLS = ["user_id","session_id","window_id","timestep"] + FEATURE_COLS
+
+def clean_columns(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", case=False)]
+    return df
+
+def to_numeric_clip(series, lower=0.0, upper=30.0):
+    s = pd.to_numeric(series, errors="coerce")
+    return s.clip(lower=lower, upper=upper)
+
+def std0(values):
+    arr = pd.to_numeric(values, errors="coerce").dropna().to_numpy(dtype=float)
+    return np.std(arr, ddof=0) if arr.size else np.nan
+
+def split_by_user(df):
+    groups = df["user_id"].astype(str).values
+
+    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=42)
+    trainval_idx, test_idx = next(gss1.split(df, groups=groups))
+    trainval = df.iloc[trainval_idx]
+    test = df.iloc[test_idx]
+
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.17647, random_state=42)
+    train_idx, val_idx = next(gss2.split(trainval, groups=trainval["user_id"].astype(str)))
+
+    return trainval.iloc[train_idx], trainval.iloc[val_idx], test
+
+def fit_scale(train, val, test):
+    scaler = RobustScaler()
+    scaler.fit(train[FEATURE_COLS])
+
+    def apply(df):
+        df = df.copy()
+        df[FEATURE_COLS] = scaler.transform(df[FEATURE_COLS])
+        return df
+
+    return scaler, apply(train), apply(val), apply(test)
+
+def build_sequences(df):
+    seqs = []
+    for _, g in df.groupby(["user_id","session_id"]):
+        arr = g[FEATURE_COLS].values.astype(np.float32)
+        if len(arr) < SEQ_LEN:
+            continue
+        for i in range(len(arr) - SEQ_LEN + 1):
+            seqs.append(arr[i:i+SEQ_LEN])
+    return np.array(seqs, dtype=np.float32)
+
+def process_dsl(path):
+    df = pd.read_csv(path)
+    df = clean_columns(df)
+
+    if "subject" in df.columns:
+        df.rename(columns={"subject":"user_id"}, inplace=True)
+    if "sessionIndex" in df.columns:
+        df.rename(columns={"sessionIndex":"session_id"}, inplace=True)
+
+    dwell_cols = [c for c in df.columns if c.startswith("H.")]
+    flight_cols = [c for c in df.columns if c.startswith("UD.")]
+
+    for c in dwell_cols + flight_cols:
+        df[c] = to_numeric_clip(df[c])
+
+    df = df.dropna(subset=["user_id","session_id"] + dwell_cols + flight_cols)
+
+    df = df.sort_values(["user_id","session_id"]).reset_index(drop=True)
+
+    dwell = df[dwell_cols].values
+    flight = df[flight_cols].values
+
+    out = pd.DataFrame({
+        "user_id": df["user_id"],
+        "session_id": df["session_id"],
+        "window_id": df.groupby(["user_id","session_id"]).cumcount()+1,
+        "timestep": df.groupby(["user_id","session_id"]).cumcount()*WINDOW_SECONDS,
+        "avg_dwell": dwell.mean(axis=1),
+        "avg_flight": flight.mean(axis=1),
+        "typing_speed": len(dwell_cols)/WINDOW_SECONDS,
+        "pause_count": (flight > PAUSE_THRESHOLD).sum(axis=1),
+        "backspace_count": 0,
+        "std_dwell": dwell.std(axis=1),
+        "std_flight": flight.std(axis=1),
+    })
+
+    # 🔍 DEBUG PRINTS (after feature creation)
+    print("Details on DSL dataset........")
+    print("Transformed shape:", out.shape)
+    print("First 5 rows:\n", out.head())
+    print("\n\n");
+
+    return out[FINAL_COLS].dropna()
+
+def process_free_text(path):
+    df = pd.read_csv(path)
+    df = clean_columns(df)
+
+    df.rename(columns={"participant":"user_id","session":"session_id"}, inplace=True)
+
+    timing_cols = [c for c in [
+        "DU.key1.key1","DD.key1.key2","DU.key1.key2",
+        "UD.key1.key2","UU.key1.key2"
+    ] if c in df.columns]
+
+    for c in timing_cols:
+        df[c] = to_numeric_clip(df[c])
+
+    df = df.dropna(subset=["user_id","session_id","key1","key2"] + timing_cols)
+
+    df["dwell"] = df.get("DU.key1.key1", df[timing_cols].mean(axis=1))
+    df["flight"] = df.get("UD.key1.key2", df[timing_cols].mean(axis=1))
+
+    df["backspace_flag"] = (df["key1"].str.lower()=="backspace").astype(int)
+
+    df["event_duration"] = (df["dwell"]+df["flight"]).clip(lower=1e-3)
+    df["event_start"] = df.groupby(["user_id","session_id"])["event_duration"].cumsum() - df["event_duration"]
+
+    df["window_bucket"] = (df["event_start"]//WINDOW_SECONDS).astype(int)
+
+    agg = df.groupby(["user_id","session_id","window_bucket"]).agg(
+        avg_dwell=("dwell","mean"),
+        avg_flight=("flight","mean"),
+        typing_speed=("dwell", lambda s: len(s)/WINDOW_SECONDS),
+        pause_count=("flight", lambda s: (s>PAUSE_THRESHOLD).sum()),
+        backspace_count=("backspace_flag","sum"),
+        std_dwell=("dwell",std0),
+        std_flight=("flight",std0),
+        timestep=("event_start","min")
+    ).reset_index()
+
+    agg["window_id"] = agg.groupby(["user_id","session_id"]).cumcount()+1
+
+    # 🔍 DEBUG PRINTS
+    print("Details on free-text dataset.....")
+    print("Transformed shape:", agg.shape)
+    print("First 5 rows:\n", agg.head())
+    print("\n\n")
+
+    return agg[FINAL_COLS].dropna()
+
+
+## main function
+
+dsl = process_dsl(DSL_PATH)
+free = process_free_text(FREE_TEXT_PATH)
+
+data = pd.concat([dsl, free]).reset_index(drop=True)
+
+data.to_csv(OUTPUT_CLEANED, index=False)
+
+train, val, test = split_by_user(data)
+
+scaler, train_s, val_s, test_s = fit_scale(train, val, test)
+
+with open(OUTPUT_SCALER, "wb") as f:
+    pickle.dump(scaler, f)
+
+scaled = pd.concat([train_s, val_s, test_s]).reset_index(drop=True)
+scaled.to_csv(OUTPUT_SCALED, index=False)
+
+train_seq = build_sequences(train_s)
+val_seq = build_sequences(val_s)
+test_seq = build_sequences(test_s)
+
+np.save(OUTPUT_SEQUENCES, {
+    "train": train_seq,
+    "val": val_seq,
+    "test": test_seq
+}, allow_pickle=True)
+
+import os
+print(os.listdir("/content"))
+
+# =========================
+# TENSORFLOW PRETRAINING (SEQ_LEN = 5)
+# =========================
+
+import numpy as np
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, Dense
+
+bundle = np.load("/content/sequence_data.npy", allow_pickle=True).item()
+X_train = bundle["train"]
+X_val   = bundle["val"]
+
+# Self-supervised (IMPORTANT)
+# If SEQ_LEN = 5 → this becomes 4
+X_tr = X_train[:, :-1, :]   # (None, 4, 7)
+y_tr = X_train[:, 1:, :]    # (None, 4, 7)
+
+X_v = X_val[:, :-1, :]
+y_v = X_val[:, 1:, :]
+
+print("X_tr shape:", X_tr.shape)  # should be (*, 4, 7)
+
+# Model (MUST MATCH X_tr)
+model = Sequential([
+    GRU(64, return_sequences=True, input_shape=(4,7)),  # ✅ 5-1 = 4
+    Dense(7)
+])
+
+model.compile(optimizer='adam', loss='mse')
+
+model.fit(
+    X_tr, y_tr,
+    epochs=10,
+    validation_data=(X_v, y_v)
+)
+
+model.save("/content/pretrained_gru_tf.keras")
+
+print("✅ Pretraining complete")
+
+import os
+import pickle
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import RobustScaler
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import Input, GRU, Dense, Dropout, GlobalAveragePooling1D
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# Paths
+CSV_PATH = "/content/session_features.csv"
+PRETRAINED_PATH = "/content/pretrained_gru_tf.keras"
+OUT_MODEL_PATH = "/content/final_model.h5"
+OUT_SCALER_PATH = "/content/session_scaler.pkl"
+
+# Sequence settings
+SEQ_LEN = 5          # matches your pretrained GRU input shape (4, 7)
+RANDOM_STATE = 42
+
+# Feature columns used by the pretrained model
+FEATURE_COLS = [
+    "avg_dwell",
+    "avg_flight",
+    "typing_speed",
+    "pause_count",
+    "backspace_count",
+    "std_dwell",
+    "std_flight",
+]
+
+df = pd.read_csv(CSV_PATH)
+
+print("Shape:", df.shape)
+print("\nColumns:", df.columns.tolist())
+print("\nMissing values:\n", df.isna().sum())
+print("\nDuplicate rows:", df.duplicated().sum())
+print("\nUsers:", df["user_id"].nunique())
+print("Sessions:", df["session_id"].nunique())
+print("\nRows per user:\n", df.groupby("user_id").size())
+print("\nRows per session summary:\n", df.groupby(["user_id", "session_id"]).size().describe())
+
+def clean_session_df(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
+
+    # Standardize column names
+    frame.columns = [str(c).strip() for c in frame.columns]
+
+    # Make sure required columns exist
+    required = ["user_id", "session_id", "window_id", "timestep"] + FEATURE_COLS
+    missing = [c for c in required if c not in frame.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+
+    # Convert numeric columns
+    for c in ["window_id", "timestep"] + FEATURE_COLS:
+        frame[c] = pd.to_numeric(frame[c], errors="coerce")
+
+    # std_flight is completely missing in your file, so fill it
+    frame["std_flight"] = frame["std_flight"].fillna(0.0)
+
+    # Fill any remaining missing values in feature columns
+    for c in FEATURE_COLS:
+        frame[c] = frame[c].fillna(frame[c].median())
+
+    # Drop duplicates
+    frame = frame.drop_duplicates().copy()
+
+    # Sort for sequence building
+    frame = frame.sort_values(["user_id", "session_id", "window_id"], kind="mergesort").reset_index(drop=True)
+
+    return frame
+
+
+df = clean_session_df(df)
+
+print(df.head())
+print("\nMissing values after cleaning:\n", df.isna().sum())
+
+def split_by_user(frame: pd.DataFrame, random_state: int = RANDOM_STATE):
+    groups = frame["user_id"].astype(str).values
+
+    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=random_state)
+    trainval_idx, test_idx = next(gss1.split(frame, groups=groups))
+    trainval = frame.iloc[trainval_idx].copy()
+    test = frame.iloc[test_idx].copy()
+
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.17647058823529413, random_state=random_state)
+    train_idx, val_idx = next(gss2.split(trainval, groups=trainval["user_id"].astype(str).values))
+    train = trainval.iloc[train_idx].copy()
+    val = trainval.iloc[val_idx].copy()
+
+    return train, val, test
+
+
+train_df, val_df, test_df = split_by_user(df)
+
+print("Train users:", train_df["user_id"].nunique())
+print("Val users:", val_df["user_id"].nunique())
+print("Test users:", test_df["user_id"].nunique())
+
+scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(25.0, 75.0))
+scaler.fit(train_df[FEATURE_COLS].astype(float))
+
+def apply_scaler(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    out.loc[:, FEATURE_COLS] = scaler.transform(out[FEATURE_COLS].astype(float))
+    return out
+
+train_df = apply_scaler(train_df)
+val_df = apply_scaler(val_df)
+test_df = apply_scaler(test_df)
+
+with open(OUT_SCALER_PATH, "wb") as f:
+    pickle.dump(scaler, f)
+
+
+
+def robust_z(s: pd.Series) -> pd.Series:
+    med = s.median()
+    q1 = s.quantile(0.25)
+    q3 = s.quantile(0.75)
+    iqr = (q3 - q1) if (q3 - q1) != 0 else 1.0
+    return (s - med) / iqr
+
+
+def make_pseudo_load_scores(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+
+    # Add a smoothed signal per session to reduce noisy labels
+    score = (
+        0.30 * robust_z(out["avg_dwell"]) +
+        0.20 * robust_z(out["avg_flight"]) +
+        0.20 * robust_z(out["pause_count"]) +
+        0.15 * robust_z(out["backspace_count"]) +
+        0.10 * robust_z(out["std_dwell"]) -
+        0.25 * robust_z(out["typing_speed"])
+    )
+
+    out["pseudo_load_score"] = score
+
+    # Smooth inside each session
+    out["pseudo_load_score"] = (
+        out.groupby(["user_id", "session_id"], sort=False)["pseudo_load_score"]
+           .transform(lambda s: s.rolling(window=3, min_periods=1).mean())
+    )
+
+    return out
+
+
+train_df = make_pseudo_load_scores(train_df)
+val_df = make_pseudo_load_scores(val_df)
+test_df = make_pseudo_load_scores(test_df)
+
+# Thresholds from training set only
+q1 = train_df["pseudo_load_score"].quantile(0.33)
+q2 = train_df["pseudo_load_score"].quantile(0.66)
+
+def score_to_label(score: pd.Series) -> pd.Series:
+    return np.select(
+        [score <= q1, score <= q2],
+        [0, 1],
+        default=2
+    ).astype(np.int32)
+
+train_df["pseudo_label"] = score_to_label(train_df["pseudo_load_score"])
+val_df["pseudo_label"] = score_to_label(val_df["pseudo_load_score"])
+test_df["pseudo_label"] = score_to_label(test_df["pseudo_load_score"])
+
+print(train_df["pseudo_label"].value_counts().sort_index())
+print(val_df["pseudo_label"].value_counts().sort_index())
+print(test_df["pseudo_label"].value_counts().sort_index())
+
+def build_sequences_with_labels(frame: pd.DataFrame, seq_len: int = SEQ_LEN):
+    frame = frame.sort_values(["user_id", "session_id", "window_id"], kind="mergesort").reset_index(drop=True)
+
+    X_list = []
+    y_list = []
+
+    for (_, _), g in frame.groupby(["user_id", "session_id"], sort=False):
+        x = g[FEATURE_COLS].to_numpy(dtype=np.float32)
+        y = g["pseudo_label"].to_numpy(dtype=np.int32)
+
+        if len(g) < seq_len:
+            continue
+
+        for i in range(len(g) - seq_len + 1):
+            x_seq = x[i:i + seq_len]
+            y_seq = y[i:i + seq_len]
+
+            # Majority vote for the sequence label
+            seq_label = np.bincount(y_seq, minlength=3).argmax()
+
+            X_list.append(x_seq)
+            y_list.append(seq_label)
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.int32)
+    return X, y
+
+
+X_train, y_train = build_sequences_with_labels(train_df, seq_len=SEQ_LEN)
+X_val, y_val = build_sequences_with_labels(val_df, seq_len=SEQ_LEN)
+X_test, y_test = build_sequences_with_labels(test_df, seq_len=SEQ_LEN)
+
+print("X_train:", X_train.shape, "y_train:", y_train.shape)
+print("X_val:", X_val.shape, "y_val:", y_val.shape)
+print("X_test:", X_test.shape, "y_test:", y_test.shape)
+
+pretrained = tf.keras.models.load_model(PRETRAINED_PATH)
+
+# Find th GRU layer in the pretrained model
+gru_weights = None
+for layer in pretrained.layers:
+    if isinstance(layer, GRU):
+        gru_weights = layer.get_weights()
+        break
+
+if gru_weights is None:
+    raise ValueError("No GRU layer found in the pretrained model.")
+
+inputs = Input(shape=(SEQ_LEN, len(FEATURE_COLS)), name="input_seq")
+
+x = GRU(64, return_sequences=True, name="gru_encoder")(inputs)
+x = GlobalAveragePooling1D()(x)
+x = Dense(32, activation="relu")(x)
+x = Dropout(0.2)(x)
+outputs = Dense(3, activation="softmax", name="load_class")(x)
+
+model = Model(inputs, outputs)
+
+# Transfer GRU weights
+model.get_layer("gru_encoder").set_weights(gru_weights)
+
+model.get_layer("gru_encoder").trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+early_stop = EarlyStopping(
+    monitor="val_loss",
+    patience=4,
+    restore_best_weights=True
+)
+
+reduce_lr = ReduceLROnPlateau(
+    monitor="val_loss",
+    factor=0.5,
+    patience=2,
+    min_lr=1e-6
+)
+
+history_1 = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=10,
+    batch_size=32,
+    callbacks=[early_stop, reduce_lr],
+    verbose=1
+)
+
+model.get_layer("gru_encoder").trainable = True
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+history_2 = model.fit(
+    X_train, y_train,
+    validation_data=(X_val, y_val),
+    epochs=15,
+    batch_size=32,
+    callbacks=[early_stop, reduce_lr],
+    verbose=1
+)
+
+
+
+import matplotlib.pyplot as plt
+plt.plot(history_2.history['accuracy'], label='train_acc')
+plt.plot(history_2.history['val_accuracy'], label='val_acc')
+plt.legend()
+plt.title("Training vs Validation Accuracy")
+plt.savefig("accuracy_plot.png")
+plt.show()
+
+# =========================
+# EVALUATION + OUTPUTS
+# =========================
+
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+from sklearn.metrics import ConfusionMatrixDisplay
+
+# Predictions
+y_prob = model.predict(X_test)
+y_pred = np.argmax(y_prob, axis=1)
+
+# 1. Accuracy
+acc = accuracy_score(y_test, y_pred)
+print("\nModel Accuracy:", round(acc * 100, 2), "%")
+
+# 2. Classification Report
+print("\nClassification report:\n")
+print(classification_report(y_test, y_pred, target_names=["low", "medium", "high"]))
+
+# 3. Confusion Matrix (print)
+cm = confusion_matrix(y_test, y_pred)
+print("\nConfusion matrix:\n")
+print(cm)
+
+# 4. Confusion Matrix (SAVE IMAGE for PPT)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Low", "Medium", "High"])
+disp.plot()
+
+plt.title("Confusion Matrix")
+plt.savefig("confusion_matrix.png")   # ✅ IMAGE FILE CREATED
+plt.show()
+
+
+print(model.summary())
+
+# 🔥 FORCE BUILD + SAVE CORRECTLY
+model.save("/content/final_model.keras")
+
+print("✅ Full model saved")
+
+import tensorflow as tf
+import keras
+
+print("TF:", tf.__version__)
+print("Keras:", keras.__version__)
+print(keras.__file__)
