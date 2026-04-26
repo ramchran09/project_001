@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>CogniFlow</title>
+<style>
+  /* ─── Reset & Base ─────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: Arial, sans-serif;
+    background: #f5f6fa;
+    margin: 20px;
+    min-height: 100vh;
+  }
+
+  /* ─── Top Bar ──────────────────────────────────────────────── */
+  .top-bar {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 10px;
+    align-items: center;
+  }
+
+  .top-bar input {
+    flex: 1;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 14px;
+    outline: none;
+  }
+
+  .top-bar input:focus { border-color: #007bff; }
+
+  /* ─── Buttons ──────────────────────────────────────────────── */
+  button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    transition: opacity 0.2s;
+  }
+
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  #startBtn                       { background: #007bff; color: white; }
+  #startBtn:not(:disabled):hover  { background: #0069d9; }
+
+  #stopBtn                        { background: #dc3545; color: white; }
+  #stopBtn:not(:disabled):hover   { background: #c82333; }
+
+  /* ─── Status Bar ───────────────────────────────────────────── */
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+    color: #555;
+    font-size: 13px;
+  }
+
+  .status-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #aaa;
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+
+  .status-dot.on  { background: #28a745; box-shadow: 0 0 6px #28a745; }
+  .status-dot.off { background: #aaa; }
+
+  /* ─── Main Layout ──────────────────────────────────────────── */
+  .main {
+    display: flex;
+    gap: 10px;
+  }
+
+  .left  { flex: 2; }
+  .right { flex: 1; }
+
+  /* ─── Textarea ─────────────────────────────────────────────── */
+  textarea {
+    width: 100%;
+    height: 350px;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    font-size: 14px;
+    resize: vertical;
+    outline: none;
+    line-height: 1.6;
+  }
+
+  textarea:focus { border-color: #007bff; }
+
+  /* ─── Hint Panel ────────────────────────────────────────────── */
+  .hint-panel {
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 14px;
+    height: 350px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .hint-title {
+    font-weight: bold;
+    font-size: 14px;
+    color: #333;
+    border-bottom: 1px solid #eee;
+    padding-bottom: 6px;
+    margin-bottom: 10px;
+  }
+
+  /* ─── Hint Items ────────────────────────────────────────────── */
+  .hint-item {
+    display: flex;
+    gap: 8px;
+    padding: 8px 0;
+    border-bottom: 1px solid #f0f0f0;
+    font-size: 13px;
+    color: #333;
+    animation: fadeIn .35s ease;
+  }
+
+  .hint-item:last-child { border-bottom: none; }
+
+  .hint-bullet {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    margin-top: 1px;
+  }
+
+  .hint-bullet.low    { background: #d4edda; color: #155724; }
+  .hint-bullet.medium { background: #fff3cd; color: #856404; }
+  .hint-bullet.high   { background: #f8d7da; color: #721c24; }
+
+  .hint-text { flex: 1; line-height: 1.5; }
+
+  /* ─── Empty State ───────────────────────────────────────────── */
+  #emptyHint {
+    color: #aaa;
+    font-size: 13px;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 20px;
+  }
+
+  /* ─── Thinking Indicator ────────────────────────────────────── */
+  #thinkingRow {
+    display: none;
+    gap: 8px;
+    padding: 8px 0;
+    align-items: center;
+    font-size: 13px;
+    color: #999;
+  }
+
+  .thinking-dots span {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: #bbb;
+    margin: 0 1px;
+    animation: bounce .9s infinite;
+  }
+  .thinking-dots span:nth-child(2) { animation-delay: .15s; }
+  .thinking-dots span:nth-child(3) { animation-delay: .30s; }
+
+  @keyframes bounce {
+    0%, 80%, 100% { transform: translateY(0); }
+    40%           { transform: translateY(-5px); }
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+</style>
+</head>
+<body>
+
+<!-- ─── TOP BAR ─────────────────────────────────────────────── -->
+<div class="top-bar">
+  <input id="problem" placeholder="Enter question / topic" />
+  <button id="startBtn" onclick="startSession()">Start</button>
+  <button id="stopBtn"  onclick="stopSession()" disabled>Stop</button>
+</div>
+
+<!-- ─── STATUS ──────────────────────────────────────────────── -->
+<div class="status">
+  <span class="status-dot off" id="statusDot"></span>
+  <span id="sessionStatus">State: OFF</span>
+</div>
+
+<!-- ─── MAIN ─────────────────────────────────────────────────── -->
+<div class="main">
+
+  <div class="left">
+    <textarea id="answer" placeholder="Start typing here after clicking Start…"></textarea>
+  </div>
+
+  <div class="right">
+    <div class="hint-panel">
+      <div class="hint-title">Hints</div>
+      <div id="emptyHint">No hints yet.<br>Start typing to get feedback.</div>
+      <div id="hintList"></div>
+      <div id="thinkingRow">
+        <span class="thinking-dots">
+          <span></span><span></span><span></span>
+        </span>
+        Analysing…
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // ── Config ────────────────────────────────────────────────────
+  const BACKEND     = "http://127.0.0.1:5000";
+  const INTERVAL_MS = 3000;
+
+  // ── State ─────────────────────────────────────────────────────
+  let running      = false;
+  let interval     = null;
+  let windowsCount = 0;
+  let lastHint     = "";
+
+  // Key-dynamics tracking
+  let keyDownTimes   = {};
+  let dwellTimes     = [];
+  let flightTimes    = [];
+  let lastKeyUpTime  = null;
+  let pauseCount     = 0;
+  let backspaceCount = 0;
+  let keyPressCount  = 0;
+  let windowStart    = null;
+
+  // ── DOM refs ──────────────────────────────────────────────────
+  const answerArea  = document.getElementById("answer");
+  const hintList    = document.getElementById("hintList");
+  const emptyHint   = document.getElementById("emptyHint");
+  const thinkingRow = document.getElementById("thinkingRow");
+  const statusDot   = document.getElementById("statusDot");
+
+  // ── Key-dynamics listeners ────────────────────────────────────
+  answerArea.addEventListener("keydown", (e) => {
+    if (!running) return;
+    const now = performance.now();
+    keyDownTimes[e.code] = now;
+
+    if (lastKeyUpTime !== null) {
+      const flight = now - lastKeyUpTime;
+      if (flight > 500) pauseCount++;
+      flightTimes.push(flight);
+    }
+
+    if (e.key === "Backspace") backspaceCount++;
+    keyPressCount++;
+  });
+
+  answerArea.addEventListener("keyup", (e) => {
+    if (!running) return;
+    const now = performance.now();
+    if (keyDownTimes[e.code] !== undefined) {
+      dwellTimes.push(now - keyDownTimes[e.code]);
+      delete keyDownTimes[e.code];
+    }
+    lastKeyUpTime = now;
+  });
+
+  // ── Metric helpers ────────────────────────────────────────────
+  function avg(arr) {
+    return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+  }
+
+  function std(arr, mean) {
+    return arr.length
+      ? Math.sqrt(arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length)
+      : 0;
+  }
+
+  function computeMetrics() {
+    const elapsed   = windowStart ? (performance.now() - windowStart) / 1000 : 3;
+    const avgDwell  = avg(dwellTimes);
+    const avgFlight = avg(flightTimes);
+    return {
+      avg_dwell:       avgDwell,
+      avg_flight:      avgFlight,
+      typing_speed:    elapsed > 0 ? keyPressCount / elapsed : 0,
+      pause_count:     pauseCount,
+      backspace_count: backspaceCount,
+      std_dwell:       std(dwellTimes,  avgDwell),
+      std_flight:      std(flightTimes, avgFlight),
+    };
+  }
+
+  function resetWindow() {
+    dwellTimes     = [];
+    flightTimes    = [];
+    pauseCount     = 0;
+    backspaceCount = 0;
+    keyPressCount  = 0;
+    windowStart    = performance.now();
+  }
+
+  // ── Session control ───────────────────────────────────────────
+  function startSession() {
+    fetch(`${BACKEND}/start`, { method: "POST" });
+
+    running      = true;
+    windowsCount = 0;
+    lastHint     = "";
+
+    hintList.innerHTML        = "";
+    emptyHint.style.display   = "flex";
+    thinkingRow.style.display = "none";
+
+    resetWindow();
+
+    statusDot.className = "status-dot on";
+    document.getElementById("sessionStatus").innerText = "State: ON";
+    document.getElementById("startBtn").disabled = true;
+    document.getElementById("stopBtn").disabled  = false;
+
+    interval = setInterval(sendData, INTERVAL_MS);
+  }
+
+  function stopSession() {
+    clearInterval(interval);
+    running = false;
+
+    statusDot.className = "status-dot off";
+    document.getElementById("sessionStatus").innerText = "State: OFF";
+    document.getElementById("startBtn").disabled = false;
+    document.getElementById("stopBtn").disabled  = true;
+  }
+
+  // ── Data sender ───────────────────────────────────────────────
+  function sendData() {
+    const row = computeMetrics();
+    resetWindow();
+    windowsCount++;
+
+    if (windowsCount === 4) {
+      thinkingRow.style.display = "flex";
+    }
+
+    fetch(`${BACKEND}/stream-data`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        row:     row,
+        problem: document.getElementById("problem").value,
+        answer:  answerArea.value,
+      }),
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.prediction) {
+        thinkingRow.style.display = "none";
+      }
+
+      if (data.hint && data.hint !== lastHint) {
+        lastHint = data.hint;
+        appendHint(data.hint, data.prediction || "medium");
+      }
+    })
+    .catch(err => console.error("stream-data error:", err));
+  }
+
+  // ── Hint rendering ────────────────────────────────────────────
+  function appendHint(text, load) {
+    emptyHint.style.display   = "none";
+    thinkingRow.style.display = "none";
+
+    const item   = document.createElement("div");
+    item.className = "hint-item";
+
+    const bullet = document.createElement("span");
+    bullet.className   = `hint-bullet ${load}`;
+    bullet.textContent = load === "high" ? "!" : load === "medium" ? "~" : "✓";
+
+    const textEl = document.createElement("span");
+    textEl.className   = "hint-text";
+    textEl.textContent = text;
+
+    item.appendChild(bullet);
+    item.appendChild(textEl);
+    hintList.appendChild(item);
+
+    hintList.parentElement.scrollTop = hintList.parentElement.scrollHeight;
+  }
+</script>
+
+</body>
+</html>
